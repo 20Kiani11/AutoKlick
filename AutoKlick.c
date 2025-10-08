@@ -2,25 +2,98 @@
 // Should take around ~1.1MB to 3MB
 // creator: 20KIANI11
 
-
 #include <windows.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
+#include <ctype.h>
 
-#define ID_HOLD_CHECK     101
-#define ID_MAX_CLICK_CHECK 102
-#define ID_APPLY_BTN      103
-#define HOTKEY_ID         1
+#define ID_HOLD_CHECK       101
+#define ID_MAX_CLICK_CHECK  102
+#define ID_SEND_KEYS_CHECK  103
+#define ID_APPLY_BTN        104
+#define ID_HELP_BTN         105
+#define HOTKEY_ID           1
 
-HWND hInterval, hButton, hKey, hMod, hStatus, hHoldCheck, hMaxClickCheck, hCPSLabel;
+HWND hInterval, hButton, hKey, hMod, hStatus, hHoldCheck, hMaxClickCheck, hSendKeysCheck;
+HWND hKeySeq, hCPSLabel;
 HFONT hFont;
 volatile bool clicking = false;
-bool holdMode = false, maxMode = false;
+bool holdMode = false, maxMode = false, sendKeysMode = false;
 UINT hotkeyVK = VK_F6;
 UINT hotkeyMod = MOD_CONTROL;
 HANDLE hClickThread = NULL;
 INPUT clickInput[2];
 int cps = 0;
+
+UINT ResolveVK(const char* key) {
+    if (strlen(key) == 1) return VkKeyScan(key[0]) & 0xFF;
+    if (_stricmp(key, "Enter") == 0) return VK_RETURN;
+    if (_stricmp(key, "Tab") == 0) return VK_TAB;
+    if (_stricmp(key, "Esc") == 0 || _stricmp(key, "Escape") == 0) return VK_ESCAPE;
+    if (_stricmp(key, "Space") == 0) return VK_SPACE;
+    if (_stricmp(key, "Backspace") == 0) return VK_BACK;
+    if (_stricmp(key, "Delete") == 0 || _stricmp(key, "Del") == 0) return VK_DELETE;
+    if (_stricmp(key, "Up") == 0) return VK_UP;
+    if (_stricmp(key, "Down") == 0) return VK_DOWN;
+    if (_stricmp(key, "Left") == 0) return VK_LEFT;
+    if (_stricmp(key, "Right") == 0) return VK_RIGHT;
+    if (_strnicmp(key, "F", 1) == 0 && isdigit(key[1])) {
+        int f = atoi(key+1);
+        if (f >= 1 && f <= 24) return VK_F1 + f - 1;
+    }
+    return 0;
+}
+
+void SendKeyCombo(const char* combo) {
+    INPUT inputs[10];
+    int count = 0;
+
+    if (strstr(combo, "Ctrl")) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = VK_CONTROL;
+        inputs[count].ki.dwFlags = 0;
+        count++;
+    }
+    if (strstr(combo, "Alt")) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = VK_MENU;
+        inputs[count].ki.dwFlags = 0;
+        count++;
+    }
+    if (strstr(combo, "Shift")) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = VK_SHIFT;
+        inputs[count].ki.dwFlags = 0;
+        count++;
+    }
+
+    const char* key = strrchr(combo, '+');
+    if (key) key++;
+    else key = combo;
+
+    UINT vk = ResolveVK(key);
+    if (vk == 0) return;
+
+    inputs[count].type = INPUT_KEYBOARD;
+    inputs[count].ki.wVk = vk;
+    inputs[count].ki.dwFlags = 0;
+    count++;
+
+    inputs[count].type = INPUT_KEYBOARD;
+    inputs[count].ki.wVk = vk;
+    inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
+    count++;
+
+    for (int i = count - 3; i >= 0; i--) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = inputs[i].ki.wVk;
+        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
+        count++;
+    }
+
+    SendInput(count, inputs, sizeof(INPUT));
+}
 
 void SetupClickInput(int button) {
     DWORD down, up;
@@ -57,7 +130,7 @@ UINT ParseKey(const char* str) {
 }
 
 void SaveSettings() {
-    char buf[64];
+    char buf[128];
     GetWindowText(hInterval, buf, sizeof(buf));
     WritePrivateProfileString("AutoKlick", "Interval", buf, "AutoKlick.ini");
 
@@ -71,15 +144,21 @@ void SaveSettings() {
     GetWindowText(hKey, buf, sizeof(buf));
     WritePrivateProfileString("AutoKlick", "Key", buf, "AutoKlick.ini");
 
+    GetWindowText(hKeySeq, buf, sizeof(buf));
+    WritePrivateProfileString("AutoKlick", "KeySequence", buf, "AutoKlick.ini");
+
     sprintf(buf, "%d", SendMessage(hHoldCheck, BM_GETCHECK, 0, 0));
     WritePrivateProfileString("AutoKlick", "HoldMode", buf, "AutoKlick.ini");
 
     sprintf(buf, "%d", SendMessage(hMaxClickCheck, BM_GETCHECK, 0, 0));
     WritePrivateProfileString("AutoKlick", "MaxMode", buf, "AutoKlick.ini");
+
+    sprintf(buf, "%d", SendMessage(hSendKeysCheck, BM_GETCHECK, 0, 0));
+    WritePrivateProfileString("AutoKlick", "SendKeysMode", buf, "AutoKlick.ini");
 }
 
 void LoadSettings() {
-    char buf[64];
+    char buf[128];
     GetPrivateProfileString("AutoKlick", "Interval", "1", buf, sizeof(buf), "AutoKlick.ini");
     SetWindowText(hInterval, buf);
 
@@ -92,42 +171,61 @@ void LoadSettings() {
     GetPrivateProfileString("AutoKlick", "Key", "F6", buf, sizeof(buf), "AutoKlick.ini");
     SetWindowText(hKey, buf);
 
+    GetPrivateProfileString("AutoKlick", "KeySequence", "", buf, sizeof(buf), "AutoKlick.ini");
+    SetWindowText(hKeySeq, buf);
+
     GetPrivateProfileString("AutoKlick", "HoldMode", "0", buf, sizeof(buf), "AutoKlick.ini");
     SendMessage(hHoldCheck, BM_SETCHECK, atoi(buf), 0);
 
     GetPrivateProfileString("AutoKlick", "MaxMode", "0", buf, sizeof(buf), "AutoKlick.ini");
     SendMessage(hMaxClickCheck, BM_SETCHECK, atoi(buf), 0);
+
+    GetPrivateProfileString("AutoKlick", "SendKeysMode", "0", buf, sizeof(buf), "AutoKlick.ini");
+    SendMessage(hSendKeysCheck, BM_SETCHECK, atoi(buf), 0);
 }
 
 DWORD WINAPI ClickLoop(LPVOID lpParam) {
     LARGE_INTEGER freq, start, now;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
-    char buf[16];
+    char buf[128];
     int interval = 1;
     cps = 0;
     DWORD lastCPS = GetTickCount();
 
     while (clicking) {
+        holdMode = SendMessage(hHoldCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        maxMode = SendMessage(hMaxClickCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        sendKeysMode = SendMessage(hSendKeysCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
         if (holdMode && !(GetAsyncKeyState(hotkeyVK) & 0x8000)) {
             clicking = false;
             SetWindowText(hStatus, "Status: Idle");
             break;
         }
 
-        maxMode = SendMessage(hMaxClickCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        if (!maxMode) {
-            GetWindowText(hInterval, buf, sizeof(buf));
-            interval = atoi(buf);
-            if (interval < 0) interval = 0;
-        }
+        GetWindowText(hInterval, buf, sizeof(buf));
+        interval = atoi(buf);
+        if (interval < 0) interval = 0;
 
-        QueryPerformanceCounter(&now);
-        double elapsed = (double)(now.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
-        if (maxMode || elapsed >= interval) {
-            SendInput(2, clickInput, sizeof(INPUT));
-            QueryPerformanceCounter(&start);
-            cps++;
+        if (sendKeysMode) {
+            char seq[256];
+            GetWindowText(hKeySeq, seq, sizeof(seq));
+            char* token = strtok(seq, "/");
+            while (token && clicking) {
+                SendKeyCombo(token);
+                Sleep(interval);
+                cps++;
+                token = strtok(NULL, "/");
+            }
+        } else {
+            QueryPerformanceCounter(&now);
+            double elapsed = (double)(now.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
+            if (maxMode || elapsed >= interval) {
+                SendInput(2, clickInput, sizeof(INPUT));
+                QueryPerformanceCounter(&start);
+                cps++;
+            }
         }
 
         DWORD nowTick = GetTickCount();
@@ -139,7 +237,7 @@ DWORD WINAPI ClickLoop(LPVOID lpParam) {
             lastCPS = nowTick;
         }
 
-        if (maxMode) Sleep(0); else Sleep(1);
+        Sleep(maxMode ? 0 : 1);
     }
     return 0;
 }
@@ -175,21 +273,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindow("STATIC","Key:",WS_VISIBLE|WS_CHILD,
                      10,115,100,25,hwnd,NULL,NULL,NULL);
 
+        hKeySeq = CreateWindow("EDIT","Ctrl+C/Alt+V",WS_VISIBLE|WS_CHILD|WS_BORDER,
+                               10,150,210,25,hwnd,NULL,NULL,NULL);
+        CreateWindow("STATIC","Key Sequence:",WS_VISIBLE|WS_CHILD,
+                     10,130,210,20,hwnd,NULL,NULL,NULL);
+
         hHoldCheck = CreateWindow("BUTTON","Hold to click",WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                                  10,150,210,25,hwnd,(HMENU)ID_HOLD_CHECK,NULL,NULL);
+                                  10,180,210,25,hwnd,(HMENU)ID_HOLD_CHECK,NULL,NULL);
         hMaxClickCheck = CreateWindow("BUTTON","Max Click (no delay)",WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                                      10,180,210,25,hwnd,(HMENU)ID_MAX_CLICK_CHECK,NULL,NULL);
+                                      10,210,210,25,hwnd,(HMENU)ID_MAX_CLICK_CHECK,NULL,NULL);
+        hSendKeysCheck = CreateWindow("BUTTON","Send Keys",WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
+                                      10,240,210,25,hwnd,(HMENU)ID_SEND_KEYS_CHECK,NULL,NULL);
 
         CreateWindow("BUTTON","Apply Hotkey",WS_VISIBLE|WS_CHILD,
-                     10,215,210,30,hwnd,(HMENU)ID_APPLY_BTN,NULL,NULL);
+                     10,270,210,30,hwnd,(HMENU)ID_APPLY_BTN,NULL,NULL);
+
+        CreateWindow("BUTTON","?",WS_VISIBLE|WS_CHILD,
+                     210,5,20,20,hwnd,(HMENU)ID_HELP_BTN,NULL,NULL);
 
         hStatus = CreateWindow("STATIC","Status: Idle",WS_VISIBLE|WS_CHILD,
-                               10,255,210,25,hwnd,NULL,NULL,NULL);
-
+                               10,310,210,25,hwnd,NULL,NULL,NULL);
         hCPSLabel = CreateWindow("STATIC","CPS: 0",WS_VISIBLE|WS_CHILD,
-                                 10,285,210,25,hwnd,NULL,NULL,NULL);
+                                 10,340,210,25,hwnd,NULL,NULL,NULL);
 
-        HWND ctrls[] = {hInterval,hButton,hMod,hKey,hHoldCheck,hMaxClickCheck,hStatus,hCPSLabel};
+        HWND ctrls[] = {hInterval,hButton,hMod,hKey,hKeySeq,hHoldCheck,hMaxClickCheck,hSendKeysCheck,hStatus,hCPSLabel};
         for (int i = 0; i < sizeof(ctrls)/sizeof(HWND); i++)
             SendMessage(ctrls[i],WM_SETFONT,(WPARAM)hFont,TRUE);
 
@@ -199,21 +306,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SetupClickInput(btn);
         return 0;
     }
-
-    case WM_HOTKEY:
-        if (clicking) {
-            clicking = false;
-            SetWindowText(hStatus,"Status: Idle");
-        } else {
-            holdMode = SendMessage(hHoldCheck,BM_GETCHECK,0,0) == BST_CHECKED;
-            maxMode  = SendMessage(hMaxClickCheck,BM_GETCHECK,0,0) == BST_CHECKED;
-            EnableWindow(hInterval, !maxMode);
-            clicking = true;
-            SetWindowText(hStatus, holdMode ? "Status: Holding" : "Status: Clicking");
-            if (hClickThread) CloseHandle(hClickThread);
-            hClickThread = CreateThread(NULL,0,ClickLoop,NULL,0,NULL);
-        }
-        return 0;
 
     case WM_COMMAND:
         if (LOWORD(wParam) == ID_APPLY_BTN) {
@@ -229,10 +321,45 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetupClickInput(btn);
 
             maxMode = SendMessage(hMaxClickCheck,BM_GETCHECK,0,0) == BST_CHECKED;
+            sendKeysMode = SendMessage(hSendKeysCheck,BM_GETCHECK,0,0) == BST_CHECKED;
+
             EnableWindow(hInterval, !maxMode);
+            EnableWindow(hButton, !sendKeysMode);
+            EnableWindow(hKeySeq, sendKeysMode);
 
             SaveSettings();
             SetWindowText(hStatus,"Status: Idle");
+        } else if (LOWORD(wParam) == ID_HELP_BTN) {
+            MessageBox(hwnd,
+                "AutoKlick Help:\n\n"
+                "- Use 'Interval' to set delay in ms.\n"
+                "- Choose mouse button or enter key sequences.\n"
+                "- Use '/' to separate key combos (e.g., Ctrl+C/Alt+V).\n"
+                "- 'Max Click' disables interval for fastest speed.\n"
+                "- 'Hold to click' only clicks while hotkey is held.\n"
+                "- 'Send Keys' enables keyboard emulation.\n"
+                "- Click 'Apply Hotkey' to activate settings.",
+                "AutoKlick Help", MB_OK | MB_ICONINFORMATION);
+        }
+        return 0;
+
+    case WM_HOTKEY:
+        if (clicking) {
+            clicking = false;
+            SetWindowText(hStatus,"Status: Idle");
+        } else {
+            holdMode = SendMessage(hHoldCheck,BM_GETCHECK,0,0) == BST_CHECKED;
+            maxMode  = SendMessage(hMaxClickCheck,BM_GETCHECK,0,0) == BST_CHECKED;
+            sendKeysMode = SendMessage(hSendKeysCheck,BM_GETCHECK,0,0) == BST_CHECKED;
+
+            EnableWindow(hInterval, !maxMode);
+            EnableWindow(hButton, !sendKeysMode);
+            EnableWindow(hKeySeq, sendKeysMode);
+
+            clicking = true;
+            SetWindowText(hStatus, holdMode ? "Status: Holding" : "Status: Clicking");
+            if (hClickThread) CloseHandle(hClickThread);
+            hClickThread = CreateThread(NULL,0,ClickLoop,NULL,0,NULL);
         }
         return 0;
 
@@ -259,7 +386,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE hPrev,LPSTR lpCmd,int nCmd) {
 
     HWND hwnd = CreateWindow("AutoClicker","AutoKlick",
                              WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME ^ WS_MAXIMIZEBOX,
-                             CW_USEDEFAULT,CW_USEDEFAULT,240,360,
+                             CW_USEDEFAULT,CW_USEDEFAULT,240,410,
                              NULL,NULL,hInst,NULL);
     ShowWindow(hwnd,nCmd);
 
